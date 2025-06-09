@@ -35,20 +35,10 @@ def setup_database_connection():
         print("Warning: [database] section not found in config.ini")
 
 def setup_scraping_urls():
-    if not os.path.exists(CONFIG_FILE_PATH):
-        raise FileNotFoundError(f"Configuration file '{CONFIG_FILE_PATH}' not found. Please create it.")
-    
-    config = configparser.ConfigParser()
-
-    if os.path.exists(CONFIG_DEVELOPMENT_FILE_PATH):
-        config.read(CONFIG_DEVELOPMENT_FILE_PATH)
-    else:
-        config.read(CONFIG_FILE_PATH)
-
-    if 'categories' in config:
-        categories = dict(config.items('categories'))
-        for category, url in categories.items():
-            JOBINDEX_URLS[category] = url
+    for subid in range(1, 151):
+        category_key = f"subid_{subid}"
+        url = f"https://www.jobindex.dk/jobsoegning?subid={subid}"
+        JOBINDEX_URLS[category_key] = url
     
     if not JOBINDEX_URLS:
         raise ValueError("No job index URLs found in configuration. Please check your config.ini.")
@@ -132,6 +122,12 @@ def extract_job_data(html_content, category):
     soup = BeautifulSoup(html_content, 'html.parser')
     job_listings = []
 
+    # --- Extract category name from the page ---
+    category_name = category  # fallback to provided category
+    category_span = soup.find('span', class_='filter-button__label')
+    if category_span:
+        category_name = category_span.get_text(strip=True)
+
     job_ad_wrappers = soup.find_all('div', id=lambda x: x and x.startswith('jobad-wrapper-'))
 
     for job_ad in job_ad_wrappers:
@@ -142,7 +138,6 @@ def extract_job_data(html_content, category):
         job_location = None
         job_description = None
         published_date = None
-        category_name = category
 
         company_div = job_ad.find('div', class_='jix-toolbar-top__company')
         if company_div:
