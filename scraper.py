@@ -4,6 +4,7 @@ import time
 import threading
 import queue
 import requests
+import tempfile
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
@@ -269,6 +270,9 @@ def scrape_and_store(start_url, db_config, category):
     try:
         chrome_options = Options()
         chrome_options.add_argument("--headless=new")
+        user_data_dir = tempfile.mkdtemp(prefix="chrome-user-data-")
+        chrome_options.add_argument(f"--user-data-dir={user_data_dir}")
+        chrome_options.add_argument("--no-sandbox")
         driver = webdriver.Chrome(options=chrome_options)
         driver.get(start_url)
         print(f"[Main] Navigating to {start_url} (Page {page_num})...")
