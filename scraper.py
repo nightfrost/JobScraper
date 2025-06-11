@@ -3,8 +3,10 @@ import os
 import time
 import threading
 import queue
+import requests
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup
@@ -14,6 +16,7 @@ CONFIG_FILE_PATH = os.path.join(os.path.dirname(__file__), 'config.ini')
 CONFIG_DEVELOPMENT_FILE_PATH = os.path.join(os.path.dirname(__file__), 'config.development.ini')
 JOBINDEX_URLS = {}
 DATABASE_CONFIG = {}
+JOBINDEX_BASE_URL = "https://www.jobindex.dk"
 
 def setup_database_connection():
     if not os.path.exists(CONFIG_FILE_PATH):
@@ -42,9 +45,7 @@ def setup_scraping_urls():
     
     if not JOBINDEX_URLS:
         raise ValueError("No job index URLs found in configuration. Please check your config.ini.")
-        
 
-# --- Database Writer Class ---
 class DatabaseWriter(threading.Thread):
     def __init__(self, db_config, data_queue):
         super().__init__()
@@ -65,7 +66,7 @@ class DatabaseWriter(threading.Thread):
             )
             self.cursor = self.cnxn.cursor()
             print("[DB Writer] Successfully connected to MSSQL database.")
-            setup_database(self.cursor) # Ensure table exists in this thread's connection
+            setup_database(self.cursor)
 
             while self.running or not self.data_queue.empty():
                 try:
@@ -94,8 +95,8 @@ class DatabaseWriter(threading.Thread):
 
     def insert_job_data_single(self, job_data):
         insert_query = """
-        INSERT INTO JobIndexPostings (CompanyName, CompanyURL, JobTitle, JobLocation, JobDescription, JobUrl, Published, Category)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO JobIndexPostings (CompanyName, CompanyURL, JobTitle, JobLocation, JobDescription, JobUrl, Published, Category, BannerPicture, FooterPicture)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         try:
             self.cursor.execute(insert_query,
@@ -106,14 +107,17 @@ class DatabaseWriter(threading.Thread):
                                 job_data["JobDescription"],
                                 job_data["JobUrl"],
                                 job_data["Published"],
-                                job_data["Category"])
+                                job_data["Category"],
+                                job_data["BannerPicture"],
+                                job_data["FooterPicture"])
             self.cnxn.commit()
         except pyodbc.Error as ex:
             sqlstate = ex.args[0]
-            print(f"[DB Writer] Error inserting data for {job_data.get('JobTitle', 'N/A')}: {sqlstate} - {ex}")
+            if 'UNIQUE' in str(ex).upper():
+                print(f"[DB Writer] Duplicate JobUrl, skipping: {job_data.get('JobUrl', 'N/A')}")
+            else:
+                print(f"[DB Writer] Error inserting data for {job_data.get('JobTitle', 'N/A')}: {sqlstate} - {ex}")
             self.cnxn.rollback()
-# --- End Database Writer Class ---
-
 
 def extract_job_data(html_content, category):
     """
@@ -122,8 +126,7 @@ def extract_job_data(html_content, category):
     soup = BeautifulSoup(html_content, 'html.parser')
     job_listings = []
 
-    # --- Extract category name from the page ---
-    category_name = category  # fallback to provided category
+    category_name = category
     category_span = soup.find('span', class_='filter-button__label')
     if category_span:
         category_name = category_span.get_text(strip=True)
@@ -138,13 +141,15 @@ def extract_job_data(html_content, category):
         job_location = None
         job_description = None
         published_date = None
+        banner_picture_bytes = None
+        footer_picture_bytes = None
 
         company_div = job_ad.find('div', class_='jix-toolbar-top__company')
         if company_div:
             company_link = company_div.find('a')
             if company_link:
                 company_name = company_link.get_text(strip=True)
-                company_url = company_link.get('href')
+                company_url = JOBINDEX_BASE_URL + company_link.get('href')
 
         job_title_h4 = job_ad.find('h4')
         if job_title_h4:
@@ -161,6 +166,27 @@ def extract_job_data(html_content, category):
 
         job_description_div = job_ad.find('div', class_='PaidJob-inner')
         if job_description_div:
+            # Banner picture (first <center> with <img>)
+            banner_center = job_description_div.find('center')
+            if banner_center:
+                banner_img = banner_center.find('img')
+                if banner_img and banner_img.get('src'):
+                    banner_url = banner_img['src']
+                    if banner_url.startswith('/'):
+                        banner_url = JOBINDEX_BASE_URL + banner_url
+                    banner_picture_bytes = download_image_as_bytes(banner_url)
+
+            # Footer picture (last <center> with <img>)
+            centers = job_description_div.find_all('center')
+            if centers:
+                footer_center = centers[-1]
+                footer_img = footer_center.find('img')
+                if footer_img and footer_img.get('src'):
+                    footer_url = footer_img['src']
+                    if footer_url.startswith('/'):
+                        footer_url = JOBINDEX_BASE_URL + footer_url
+                    footer_picture_bytes = download_image_as_bytes(footer_url)
+
             description_parts = []
             for tag in job_description_div.find_all(['p', 'ul', 'li']):
                 if tag.name == 'ul':
@@ -169,6 +195,7 @@ def extract_job_data(html_content, category):
                 else:
                     description_parts.append(tag.get_text(strip=True))
             job_description = "\n".join(description_parts).strip()
+            
 
         published_div = job_ad.find('div', class_='jix-toolbar__pubdate')
         if published_div:
@@ -185,8 +212,19 @@ def extract_job_data(html_content, category):
             "JobUrl": job_url,
             "Published": published_date,
             "Category": category_name,
+            "BannerPicture": banner_picture_bytes,
+            "FooterPicture": footer_picture_bytes,
         })
     return job_listings
+
+def download_image_as_bytes(url):
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            return response.content
+    except Exception as e:
+        print(f"[Image Download] Failed to download {url}: {e}")
+    return None
 
 def setup_database(cursor):
     """
@@ -201,9 +239,11 @@ def setup_database(cursor):
         JobTitle NVARCHAR(MAX),
         JobLocation NVARCHAR(255),
         JobDescription NVARCHAR(MAX),
-        JobUrl NVARCHAR(MAX),
+        JobUrl NVARCHAR(512) UNIQUE,
         Published DATETIME,
-        Category NVARCHAR(255)
+        Category NVARCHAR(255),
+        BannerPicture VARBINARY(MAX),
+        FooterPicture VARBINARY(MAX)
     )
     """
     try:
@@ -221,13 +261,15 @@ def scrape_and_store(start_url, db_config, category):
     driver = None
     data_queue = queue.Queue() # Queue for passing job data to the DB writer thread
     db_writer_thread = DatabaseWriter(db_config, data_queue)
-    db_writer_thread.start() # Start the database writer thread
+    db_writer_thread.start()
 
     page_num = 1
     total_jobs_scraped = 0
 
     try:
-        driver = webdriver.Chrome()
+        chrome_options = Options()
+        chrome_options.add_argument("--headless=new")
+        driver = webdriver.Chrome(options=chrome_options)
         driver.get(start_url)
         print(f"[Main] Navigating to {start_url} (Page {page_num})...")
 
@@ -243,6 +285,14 @@ def scrape_and_store(start_url, db_config, category):
         except Exception as e:
             print(f"[Main] No cookie consent button found (id='jix-cookie-consent-accept-all') or error handling: {e}. Proceeding anyway.")
         
+        # --- Check for 404 Not Found Page (cookie consent will come first always) ---
+        try:
+            page_source = driver.page_source
+            if '<h1>Siden kan ikke findes</h1>' in page_source:
+                print(f"[Main] 404 Not Found detected for URL: {start_url}. Skipping this category.")
+                return
+        except Exception as e:
+            print(f"[Main] Error checking for 404 page: {e}")
 
         # --- Handle JobAgent Modal ---
         try:
@@ -267,7 +317,7 @@ def scrape_and_store(start_url, db_config, category):
             current_page_listings = extract_job_data(html_content, category)
             
             if current_page_listings:
-                data_queue.put(current_page_listings) # Put the list of jobs for this page into the queue
+                data_queue.put(current_page_listings) 
                 total_jobs_scraped += len(current_page_listings)
                 print(f"[Main] Found {len(current_page_listings)} job listings on Page {page_num}. Added to queue.")
             else:
@@ -309,8 +359,8 @@ def scrape_and_store(start_url, db_config, category):
 
         # Signal the DB writer thread to stop and wait for it to finish
         print("[Main] Sending stop signal to DB writer and waiting for it to finish...")
-        data_queue.put(None) # Sentinel value to stop the thread
-        db_writer_thread.join() # Wait for the DB writer thread to complete
+        data_queue.put(None)
+        db_writer_thread.join()
         print(f"[Main] Scraping completed. Total jobs added to queue: {total_jobs_scraped}")
 
 if __name__ == "__main__":
