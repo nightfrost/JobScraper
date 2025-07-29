@@ -21,10 +21,18 @@ JobScraper is a Python script that scrapes job postings from [jobindex.dk](https
 
 ### Python Packages
 
+
 Install dependencies with:
 
 ```sh
-pip install selenium beautifulsoup4 requests pyodbc
+pip install selenium beautifulsoup4 requests pyodbc spacy yake rake-nltk
+```
+
+For best accuracy, the script will attempt to use the largest available spaCy models for Danish and English. You may want to pre-download them:
+
+```sh
+python -m spacy download da_core_news_md
+python -m spacy download en_core_web_lg
 ```
 
 ## Configuration
@@ -65,7 +73,15 @@ password = your_password
 python scraper.py
 ```
 
-The script will iterate through all job categories and store job postings in the `JobIndexPostings` table.
+
+The script will iterate through all job categories and store job postings in the `JobIndexPostingsExtended` table.
+
+### Advanced Keyword Extraction
+
+- Uses the best available spaCy models for Danish and English (NER and noun chunks)
+- Integrates [YAKE](https://github.com/LIAAD/yake) and [RAKE](https://github.com/csurfer/rake-nltk) for multi-word keyphrase extraction
+- Uses the job category as a domain-specific keyword
+- All extracted keywords are stored in the `Keywords` column
 
 ## Database Table
 
@@ -84,6 +100,7 @@ The script will automatically create the following table if it does not exist:
 | Category       | NVARCHAR(255)   | Job category               |
 | BannerPicture  | VARBINARY(MAX)  | Banner image (if any)      |
 | FooterPicture  | VARBINARY(MAX)  | Footer image (if any)      |
+| Keywords       | NVARCHAR(MAX)   | Extracted keywords/phrases |
 
 ## Notes
 

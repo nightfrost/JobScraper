@@ -12,6 +12,25 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup
 import pyodbc 
+import spacy
+from spacy.util import is_package
+
+try:
+    nlp_da = spacy.load("da_core_news_md")
+except Exception:
+    try:
+        spacy.cli.download("da_core_news_md")
+        nlp_da = spacy.load("da_core_news_md")
+    except Exception:
+        nlp_da = spacy.load("da_core_news_sm")
+try:
+    nlp_en = spacy.load("en_core_web_lg")
+except Exception:
+    try:
+        spacy.cli.download("en_core_web_lg")
+        nlp_en = spacy.load("en_core_web_lg")
+    except Exception:
+        nlp_en = spacy.load("en_core_web_md")
 
 CONFIG_FILE_PATH = os.path.join(os.path.dirname(__file__), 'config.ini')
 CONFIG_DEVELOPMENT_FILE_PATH = os.path.join(os.path.dirname(__file__), 'config.development.ini')
@@ -96,8 +115,8 @@ class DatabaseWriter(threading.Thread):
 
     def insert_job_data_single(self, job_data):
         insert_query = """
-        INSERT INTO JobIndexPostings (CompanyName, CompanyURL, JobTitle, JobLocation, JobDescription, JobUrl, Published, Category, BannerPicture, FooterPicture)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO JobIndexPostingsExtended (CompanyName, CompanyURL, JobTitle, JobLocation, JobDescription, JobUrl, Published, Category, BannerPicture, FooterPicture, Keywords)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         try:
             self.cursor.execute(insert_query,
@@ -110,7 +129,8 @@ class DatabaseWriter(threading.Thread):
                                 job_data["Published"],
                                 job_data["Category"],
                                 job_data["BannerPicture"],
-                                job_data["FooterPicture"])
+                                job_data["FooterPicture"],
+                                job_data["Keywords"])
             self.cnxn.commit()
         except pyodbc.Error as ex:
             sqlstate = ex.args[0]
@@ -165,6 +185,8 @@ def extract_job_data(html_content, category):
             if job_location_span:
                 job_location = job_location_span.get_text(strip=True)
 
+
+        # Extract banner and footer images from the original job listing HTML
         job_description_div = job_ad.find('div', class_='PaidJob-inner')
         if job_description_div:
             # Banner picture (first <center> with <img>)
@@ -188,21 +210,167 @@ def extract_job_data(html_content, category):
                         footer_url = JOBINDEX_BASE_URL + footer_url
                     footer_picture_bytes = download_image_as_bytes(footer_url)
 
-            description_parts = []
-            for tag in job_description_div.find_all(['p', 'ul', 'li']):
-                if tag.name == 'ul':
-                    items = [li.get_text(strip=True) for li in tag.find_all('li')]
-                    description_parts.append("\n".join(f"- {item}" for item in items))
+        # Always fetch and use the description from the JobUrl using spaCy for all sites
+        if job_url:
+            try:
+                if job_url.startswith('/'):
+                    job_url_full = JOBINDEX_BASE_URL + job_url
+                elif job_url.startswith('http'):
+                    job_url_full = job_url
                 else:
-                    description_parts.append(tag.get_text(strip=True))
-            job_description = "\n".join(description_parts).strip()
-            
+                    job_url_full = JOBINDEX_BASE_URL + '/' + job_url.lstrip('/')
+                resp = requests.get(job_url_full, timeout=10)
+                if resp.status_code == 200:
+                    soup2 = BeautifulSoup(resp.text, 'html.parser')
+                    # --- Custom handling for systematic.com ---
+                    if "systematic.com" in job_url_full:
+                        # Extract only from div with class 'job'
+                        main_content = soup2.find('div', class_='job')
+                        if main_content:
+                            text_blocks = []
+                            for tag in main_content.find_all(['h1', 'h2', 'h3', 'p', 'li', 'span']):
+                                txt = tag.get_text(separator=" ", strip=True)
+                                if txt and len(txt) > 30:
+                                    text_blocks.append(txt)
+                            full_text = "\n".join(text_blocks)
+                        else:
+                            # fallback to all text
+                            full_text = soup2.get_text(separator=" ", strip=True)
+                        print(f"[spaCy Extraction] Custom systematic.dk extraction for {job_url}")
+                    else:
+                        # Generic spaCy extraction for all other sites (including JobIndex)
+                        text_blocks = []
+                        for tag in soup2.find_all(['h1', 'h2', 'h3', 'p', 'li', 'span']):
+                            txt = tag.get_text(separator=" ", strip=True)
+                            if txt and len(txt) > 30:
+                                text_blocks.append(txt)
+                        full_text = "\n".join(text_blocks)
+                    # --- spaCy processing (for both cases) ---
+                    doc_da = nlp_da(full_text)
+                    doc_en = nlp_en(full_text)
+                    def extract_relevant_sentences(doc, category_name):
+                        sents = list(doc.sents)
+                        scored = []
+                        for s in sents:
+                            score = 0
+                            if category_name.lower() in s.text.lower():
+                                score += 2
+                            score += len(s.ents)
+                            score += len(s.text) // 80
+                            scored.append((score, s.text))
+                        scored.sort(reverse=True)
+                        return [t for _, t in scored[:5]]
+                    relevant = extract_relevant_sentences(doc_da, category_name)
+                    if not relevant or sum(len(s) for s in relevant) < 100:
+                        relevant = extract_relevant_sentences(doc_en, category_name)
+                    if relevant:
+                        job_description = "\n".join(relevant).strip()
+                    else:
+                        job_description = full_text[:1000]  # fallback: first 1000 chars
+
+                    # --- Fallback extraction for CompanyName, CompanyURL, JobLocation if missing ---
+                    def is_missing(val):
+                        return val is None or (isinstance(val, str) and not val.strip())
+
+                    # Fallback CompanyName: first ORG entity (DA, then EN)
+                    if is_missing(company_name):
+                        orgs = [ent.text for ent in doc_da.ents if ent.label_ == "ORG"]
+                        if not orgs:
+                            orgs = [ent.text for ent in doc_en.ents if ent.label_ == "ORG"]
+                        if orgs:
+                            company_name = orgs[0]
+
+                    # Fallback CompanyURL: look for a URL in the text (simple regex)
+                    if is_missing(company_url):
+                        import re
+                        url_pattern = r"https?://[\w\.-]+(?:/[\w\.-]*)*"
+                        urls_found = re.findall(url_pattern, full_text)
+                        # Try to avoid jobindex/systematic links, prefer company domains
+                        urls_found = [u for u in urls_found if not any(x in u for x in ["jobindex.dk", "systematic.dk"])]
+                        if urls_found:
+                            company_url = urls_found[0]
+
+                    # Fallback JobLocation: first GPE or LOC entity (DA, then EN)
+                    if is_missing(job_location):
+                        locs = [ent.text for ent in doc_da.ents if ent.label_ in ("GPE", "LOC")]
+                        if not locs:
+                            locs = [ent.text for ent in doc_en.ents if ent.label_ in ("GPE", "LOC")]
+                        if locs:
+                            job_location = locs[0]
+
+            except Exception as e:
+                print(f"[JobUrl Description] Failed to fetch or extract description from {job_url}: {e}")
 
         published_div = job_ad.find('div', class_='jix-toolbar__pubdate')
         if published_div:
             time_tag = published_div.find('time')
             if time_tag:
                 published_date = time_tag.get('datetime')
+
+        # --- Keyword extraction using spaCy (Danish and English), YAKE, and RAKE ---
+        keywords = []
+        custom_stopwords = {"job", "stilling", "company", "virksomhed", "arbejde", "position", "ansøgning", "opgaver", category_name.lower()}
+        if job_description:
+            # spaCy Danish
+            doc_da = nlp_da(job_description)
+            for ent in doc_da.ents:
+                if ent.label_ in {"ORG", "PRODUCT", "GPE", "PERSON", "NORP", "FAC", "EVENT", "WORK_OF_ART", "LAW", "LANGUAGE"}:
+                    if ent.text.lower() not in custom_stopwords:
+                        keywords.append(ent.text)
+            for chunk in doc_da.noun_chunks:
+                keyword_set = set(keywords)
+                if len(chunk.text) > 2 and chunk.text.lower() not in {k.lower() for k in keyword_set | custom_stopwords}:
+                    keywords.append(chunk.text)
+            # spaCy English
+            doc_en = nlp_en(job_description)
+            for ent in doc_en.ents:
+                if ent.label_ in {"ORG", "PRODUCT", "GPE", "PERSON", "NORP", "FAC", "EVENT", "WORK_OF_ART", "LAW", "LANGUAGE"}:
+                    if ent.text.lower() not in custom_stopwords:
+                        keywords.append(ent.text)
+            for chunk in doc_en.noun_chunks:
+                keyword_set = set(keywords)
+                if len(chunk.text) > 2 and chunk.text.lower() not in {k.lower() for k in keyword_set | custom_stopwords}:
+                    keywords.append(chunk.text)
+            # YAKE (Danish)
+            try:
+                import yake
+                kw_extractor_da = yake.KeywordExtractor(lan="da", n=1, top=10)
+                yake_keywords_da = [kw for kw, score in kw_extractor_da.extract_keywords(job_description)]
+                keywords.extend([k for k in yake_keywords_da if k.lower() not in custom_stopwords])
+            except Exception as e:
+                pass
+            # YAKE (English)
+            try:
+                kw_extractor_en = yake.KeywordExtractor(lan="en", n=1, top=10)
+                yake_keywords_en = [kw for kw, score in kw_extractor_en.extract_keywords(job_description)]
+                keywords.extend([k for k in yake_keywords_en if k.lower() not in custom_stopwords])
+            except Exception as e:
+                pass
+            # RAKE (English)
+            try:
+                from rake_nltk import Rake
+                rake = Rake(language='english', stopwords=None)
+                rake.extract_keywords_from_text(job_description)
+                rake_keywords = rake.get_ranked_phrases()[:10]
+                keywords.extend([k for k in rake_keywords if k.lower() not in custom_stopwords])
+            except Exception as e:
+                pass
+            # RAKE (Danish) - not natively supported, but can use English stopwords as fallback
+            try:
+                from rake_nltk import Rake
+                rake_da = Rake(language='danish', stopwords=None)
+                rake_da.extract_keywords_from_text(job_description)
+                rake_keywords_da = rake_da.get_ranked_phrases()[:10]
+                keywords.extend([k for k in rake_keywords_da if k.lower() not in custom_stopwords])
+            except Exception as e:
+                pass
+            # Add the category name as a keyword (domain knowledge)
+            if category_name and category_name.lower() not in custom_stopwords:
+                keywords.append(category_name)
+            # Filter, deduplicate, and clean
+            keywords = [k.strip() for k in keywords if len(k.strip()) > 1]
+            keywords = list(dict.fromkeys(keywords))  # preserve order, remove duplicates
+        keywords_str = ", ".join(keywords)
 
         job_listings.append({
             "CompanyName": company_name,
@@ -215,6 +383,7 @@ def extract_job_data(html_content, category):
             "Category": category_name,
             "BannerPicture": banner_picture_bytes,
             "FooterPicture": footer_picture_bytes,
+            "Keywords": keywords_str,
         })
     return job_listings
 
@@ -232,8 +401,8 @@ def setup_database(cursor):
     Sets up the MSSQL database table if it doesn't exist.
     """
     create_table_query = """
-    IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='JobIndexPostings' and xtype='U')
-    CREATE TABLE JobIndexPostings (
+    IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='JobIndexPostingsExtended' and xtype='U')
+    CREATE TABLE JobIndexPostingsExtended (
         JobID INT IDENTITY(1,1) PRIMARY KEY,
         CompanyName NVARCHAR(255),
         CompanyURL NVARCHAR(MAX),
@@ -244,7 +413,8 @@ def setup_database(cursor):
         Published DATETIME,
         Category NVARCHAR(255),
         BannerPicture VARBINARY(MAX),
-        FooterPicture VARBINARY(MAX)
+        FooterPicture VARBINARY(MAX),
+        Keywords NVARCHAR(MAX)
     )
     """
     try:
