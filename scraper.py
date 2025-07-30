@@ -37,6 +37,23 @@ CONFIG_DEVELOPMENT_FILE_PATH = os.path.join(os.path.dirname(__file__), 'config.d
 JOBINDEX_URLS = {}
 DATABASE_CONFIG = {}
 JOBINDEX_BASE_URL = "https://www.jobindex.dk"
+EXISTING_JOB_URLS = set()
+
+def setup_existing_joburls():
+    conn = pyodbc.connect(
+        'DRIVER={ODBC Driver 17 for SQL Server};'
+        f'SERVER={DATABASE_CONFIG["server"]};'
+        f'DATABASE={DATABASE_CONFIG["database"]};'
+        f'UID={DATABASE_CONFIG["username"]};'
+        f'PWD={DATABASE_CONFIG["password"]}'
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT JobUrl FROM JobIndexPostingsExtended")
+    rows = cursor.fetchall()
+    for row in rows:
+        EXISTING_JOB_URLS.add(row[0])
+    cursor.close()
+    conn.close()
 
 def setup_database_connection():
     if not os.path.exists(CONFIG_FILE_PATH):
@@ -165,6 +182,17 @@ def extract_job_data(html_content, category):
         banner_picture_bytes = None
         footer_picture_bytes = None
 
+        job_title_h4 = job_ad.find('h4')
+        if job_title_h4:
+            job_link = job_title_h4.find('a')
+            if job_link:
+                job_title = job_link.get_text(strip=True)
+                job_url = job_link.get('href')
+        
+        if not job_url or job_url in EXISTING_JOB_URLS:
+            print(f"[JobUrl Skipped] JobUrl already exists or is invalid: {job_url}")
+            continue
+
         company_div = job_ad.find('div', class_='jix-toolbar-top__company')
         if company_div:
             company_link = company_div.find('a')
@@ -172,19 +200,11 @@ def extract_job_data(html_content, category):
                 company_name = company_link.get_text(strip=True)
                 company_url = JOBINDEX_BASE_URL + company_link.get('href')
 
-        job_title_h4 = job_ad.find('h4')
-        if job_title_h4:
-            job_link = job_title_h4.find('a')
-            if job_link:
-                job_title = job_link.get_text(strip=True)
-                job_url = job_link.get('href')
-
         job_location_div = job_ad.find('div', class_='jobad-element-area')
         if job_location_div:
             job_location_span = job_location_div.find('span')
             if job_location_span:
                 job_location = job_location_span.get_text(strip=True)
-
 
         # Extract banner and footer images from the original job listing HTML
         job_description_div = job_ad.find('div', class_='PaidJob-inner')
@@ -420,7 +440,7 @@ def setup_database(cursor):
     try:
         cursor.execute(create_table_query)
         cursor.commit()
-        print("[Main] Database table 'JobIndexPostings' checked/created successfully.")
+        print("[Main] Database table 'JobIndexPostingsExtended' checked/created successfully.")
     except Exception as e:
         print(f"[Main] Error setting up database table: {e}")
 
@@ -539,7 +559,9 @@ def scrape_and_store(start_url, db_config, category):
 
 if __name__ == "__main__":
     setup_database_connection()
+    setup_existing_joburls()
     setup_scraping_urls()
     for category, url in JOBINDEX_URLS.items():
+        setup_existing_joburls()
         print(f"[Main] Starting scrape for category '{category}' with URL: {url}")
         scrape_and_store(url, DATABASE_CONFIG, category)
