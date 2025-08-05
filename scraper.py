@@ -16,11 +16,11 @@ import spacy
 from spacy.util import is_package
 
 try:
-    nlp_da = spacy.load("da_core_news_md")
+    nlp_da = spacy.load("da_core_news_lg")
 except Exception:
     try:
-        spacy.cli.download("da_core_news_md")
-        nlp_da = spacy.load("da_core_news_md")
+        spacy.cli.download("da_core_news_lg")
+        nlp_da = spacy.load("da_core_news_lg")
     except Exception:
         nlp_da = spacy.load("da_core_news_sm")
 try:
@@ -75,7 +75,7 @@ def setup_database_connection():
         print("Warning: [database] section not found in config.ini")
 
 def setup_scraping_urls():
-    for subid in range(1, 151):
+    for subid in range(1, 200):
         category_key = f"subid_{subid}"
         url = f"https://www.jobindex.dk/jobsoegning?subid={subid}"
         JOBINDEX_URLS[category_key] = url
@@ -84,6 +84,19 @@ def setup_scraping_urls():
         raise ValueError("No job index URLs found in configuration. Please check your config.ini.")
 
 class DatabaseWriter(threading.Thread):
+    def update_category_for_joburl(self, job_url, new_category):
+        """
+        Link the job to the new category in the join table (normalized schema).
+        """
+        try:
+            category_id = get_or_create_category(self.cursor, new_category)
+            job_id = get_jobid_by_url(self.cursor, job_url)
+            if job_id and category_id:
+                link_job_category(self.cursor, job_id, category_id)
+                self.cnxn.commit()
+                print(f"[DB Writer] Linked job {job_url} to category '{new_category}' (ID {category_id})")
+        except Exception as e:
+            print(f"[DB Writer] Error updating category for {job_url}: {e}")
     def __init__(self, db_config, data_queue):
         super().__init__()
         self.db_config = db_config
@@ -114,7 +127,13 @@ class DatabaseWriter(threading.Thread):
                         break
 
                     for job_data in job_data_list:
-                        self.insert_job_data_single(job_data)
+                        # Check if job already exists (by JobUrl)
+                        self.cursor.execute("SELECT JobUrl FROM JobIndexPostingsExtended WHERE JobUrl = ?", job_data["JobUrl"])
+                        if self.cursor.fetchone():
+                            # Update category if needed
+                            self.update_category_for_joburl(job_data["JobUrl"], job_data["Category"])
+                        else:
+                            self.insert_job_data_single(job_data)
                     self.data_queue.task_done()
                 except queue.Empty:
                     continue # No data, keep checking
@@ -132,8 +151,8 @@ class DatabaseWriter(threading.Thread):
 
     def insert_job_data_single(self, job_data):
         insert_query = """
-        INSERT INTO JobIndexPostingsExtended (CompanyName, CompanyURL, JobTitle, JobLocation, JobDescription, JobUrl, Published, Category, BannerPicture, FooterPicture, Keywords)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO JobIndexPostingsExtended (CompanyName, CompanyURL, JobTitle, JobLocation, JobDescription, JobUrl, Published, BannerPicture, FooterPicture, Keywords)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         try:
             self.cursor.execute(insert_query,
@@ -144,10 +163,18 @@ class DatabaseWriter(threading.Thread):
                                 job_data["JobDescription"],
                                 job_data["JobUrl"],
                                 job_data["Published"],
-                                job_data["Category"],
                                 job_data["BannerPicture"],
                                 job_data["FooterPicture"],
                                 job_data["Keywords"])
+            # Get JobID of inserted job
+            self.cursor.execute("SELECT JobID FROM JobIndexPostingsExtended WHERE JobUrl = ?", job_data["JobUrl"])
+            row = self.cursor.fetchone()
+            if row:
+                job_id = row[0]
+                # Link to category (create if needed)
+                category_id = get_or_create_category(self.cursor, job_data["Category"])
+                if category_id:
+                    link_job_category(self.cursor, job_id, category_id)
             self.cnxn.commit()
         except pyodbc.Error as ex:
             sqlstate = ex.args[0]
@@ -188,9 +215,10 @@ def extract_job_data(html_content, category):
             if job_link:
                 job_title = job_link.get_text(strip=True)
                 job_url = job_link.get('href')
-        
-        if not job_url or job_url in EXISTING_JOB_URLS:
-            print(f"[JobUrl Skipped] JobUrl already exists or is invalid: {job_url}")
+
+        # Do not skip if job_url exists; let DB writer handle category update
+        if not job_url:
+            print(f"[JobUrl Skipped] JobUrl is invalid: {job_url}")
             continue
 
         company_div = job_ad.find('div', class_='jix-toolbar-top__company')
@@ -257,14 +285,155 @@ def extract_job_data(html_content, category):
                             # fallback to all text
                             full_text = soup2.get_text(separator=" ", strip=True)
                         print(f"[spaCy Extraction] Custom systematic.dk extraction for {job_url}")
+                    elif "www.jobindex.dk/jobannonce/" in job_url_full:
+                        # Extract only from div with class 'jobtext-jobad__main'
+                        main_content = soup2.find('div', class_='jobtext-jobad__main')
+                        if not main_content:
+                            main_content = soup2.find('div', class_='job-text')
+                        if not main_content:
+                            main_content = soup2.find('div', class_='jobtext')
+                        if not main_content:
+                            main_content = soup2.find('div', class_='jobcontent')
+                        if not main_content:
+                            main_content = soup2.find('div', class_='job')
+
+                        if main_content:
+                            text_blocks = []
+                            for tag in main_content.find_all(['h1', 'h2', 'h3', 'p', 'li', 'span']):
+                                txt = tag.get_text(separator=" ", strip=True)
+                                if txt and len(txt) > 30:
+                                    text_blocks.append(txt)
+                            full_text = "\n".join(text_blocks)
+                        else:
+                            # fallback to all text
+                            full_text = soup2.get_text(separator=" ", strip=True)
+                    elif "candidate.hr-manager.net" in job_url_full:
+                        # Extract only from div with class 'AdContentContainer'
+                        main_content = soup2.find('div', class_='AdContentContainer')
+                        if main_content:
+                            text_blocks = []
+                            for tag in main_content.find_all(['h1', 'h2', 'h3', 'p', 'li', 'span']):
+                                txt = tag.get_text(separator=" ", strip=True)
+                                if txt and len(txt) > 30:
+                                    text_blocks.append(txt)
+                            full_text = "\n".join(text_blocks)
+                        else:
+                            # fallback to all text
+                            full_text = soup2.get_text(separator=" ", strip=True)
+                    elif "myworkdayjobs.com" in job_url_full:
+                        # Extract only from div with class 'job-posting-details'
+                        main_content = soup2.find('div', class_='job-posting-details')
+                        if main_content:
+                            text_blocks = []
+                            for tag in main_content.find_all(['h1', 'h2', 'h3', 'p', 'li', 'span']):
+                                txt = tag.get_text(separator=" ", strip=True)
+                                if txt and len(txt) > 30:
+                                    text_blocks.append(txt)
+                            full_text = "\n".join(text_blocks)
+                        else:
+                            # fallback to all text
+                            full_text = soup2.get_text(separator=" ", strip=True)
+                    elif "jyskebank.dk" in job_url_full:
+                        # Extract only from div with class 'job-description'
+                        main_content = soup2.find('div', class_='umb-richtext')
+                        if main_content:
+                            text_blocks = []
+                            for tag in main_content.find_all(['h1', 'h2', 'h3', 'p', 'li', 'span']):
+                                txt = tag.get_text(separator=" ", strip=True)
+                                if txt and len(txt) > 30:
+                                    text_blocks.append(txt)
+                            full_text = "\n".join(text_blocks)
+                        else:
+                            # fallback to all text
+                            full_text = soup2.get_text(separator=" ", strip=True)
+                    elif "kirklarsen.dk" in job_url_full:
+                        # Extract only from div with class 'job-description'
+                        main_content = soup2.find('div', class_='js-primary-contents-container')
+                        if main_content:
+                            text_blocks = []
+                            for tag in main_content.find_all(['h1', 'h2', 'h3', 'p', 'li', 'span']):
+                                txt = tag.get_text(separator=" ", strip=True)
+                                if txt and len(txt) > 30:
+                                    text_blocks.append(txt)
+                            full_text = "\n".join(text_blocks)
+                        else:
+                            # fallback to all text
+                            full_text = soup2.get_text(separator=" ", strip=True)
+                    elif "jobbank.dk" in job_url_full:
+                        # Extract only from div with class 'job-description'
+                        main_content = soup2.find('div', class_='jobText')
+                        if main_content:
+                            text_blocks = []
+                            for tag in main_content.find_all(['h1', 'h2', 'h3', 'p', 'li', 'span']):
+                                txt = tag.get_text(separator=" ", strip=True)
+                                if txt and len(txt) > 30:
+                                    text_blocks.append(txt)
+                            full_text = "\n".join(text_blocks)
+                        else:
+                            # fallback to all text
+                            full_text = soup2.get_text(separator=" ", strip=True)
+                    elif "oraclecloud.com" in job_url_full:
+                        # Extract only from div with class 'job-description'
+                        main_content = soup2.find('div', class_='job-details__description-content')
+                        if main_content:
+                            text_blocks = []
+                            for tag in main_content.find_all(['h1', 'h2', 'h3', 'p', 'li', 'span']):
+                                txt = tag.get_text(separator=" ", strip=True)
+                                if txt and len(txt) > 30:
+                                    text_blocks.append(txt)
+                            full_text = "\n".join(text_blocks)
+                        else:
+                            # fallback to all text
+                            full_text = soup2.get_text(separator=" ", strip=True)
                     else:
-                        # Generic spaCy extraction for all other sites (including JobIndex)
-                        text_blocks = []
-                        for tag in soup2.find_all(['h1', 'h2', 'h3', 'p', 'li', 'span']):
-                            txt = tag.get_text(separator=" ", strip=True)
-                            if txt and len(txt) > 30:
-                                text_blocks.append(txt)
-                        full_text = "\n".join(text_blocks)
+                        # Generic spaCy extraction for other sites
+                        main_content = soup2.find('div', class_='jobtext-jobad__main')
+                        if not main_content:
+                            main_content = soup2.find('div', class_='job-text')
+                        if not main_content:
+                            main_content = soup2.find('div', class_='jobtext')
+                        if not main_content:
+                            main_content = soup2.find('div', class_='jobText')
+                        if not main_content:
+                            main_content = soup2.find('div', class_='jobcontent')
+                        if not main_content:
+                            main_content = soup2.find('div', class_='jobContent')
+                        if not main_content:
+                            main_content = soup2.find('div', class_='job')
+                        if not main_content:
+                            main_content = soup2.find('div', class_='js-primary-contents-container')
+                        if not main_content:
+                            main_content = soup2.find('div', class_='job-posting-details')
+                        if not main_content:
+                            main_content = soup2.find('div', class_='AdContentContainer')
+
+                        if main_content:
+                            text_blocks = []
+                            for tag in main_content.find_all(['h1', 'h2', 'h3', 'p', 'li', 'span']):
+                                txt = tag.get_text(separator=" ", strip=True)
+                                if txt and len(txt) > 30:
+                                    text_blocks.append(txt)
+                            full_text = "\n".join(text_blocks)
+                        else:
+                            text_blocks = []
+                            for tag in soup2.find_all(['h1', 'h2', 'h3', 'p', 'li', 'span']):
+                                txt = tag.get_text(separator=" ", strip=True)
+                                if txt and len(txt) > 30:
+                                    text_blocks.append(txt)
+                            full_text = "\n".join(text_blocks)
+                            # Remove unwanted boilerplate text for jobindex.dk
+                            if "jobindex.dk" in job_url_full:
+                                unwanted_phrases = [
+                                    "Søg jobbet nemt fra mobilen Jobannoncearkiv Find inspiration i udløbne jobopslag Få en jobvejleder Bliv afklaret i din jobsøgning Jobs For Ukraine Hjælper ukrainske flygtninge med at få job",
+                                    "Søg job Vælg mellem flere søgekriterier",
+                                    "Din side Skab overblik over din jobsøgning",
+                                    "Jobagent",
+                                    "Få en jobvejleder Bliv afklaret i din jobsøgning",
+                                    "Jobs For Ukraine Hjælper ukrainske flygtninge med at få job",
+                                    "Arbejdspladser Se virksomhedsprofiler Få viden om din næste arbejdsplads Evaluér arbejdsplads"
+                                ]
+                                for phrase in unwanted_phrases:
+                                    full_text = full_text.replace(phrase, "")
                     # --- spaCy processing (for both cases) ---
                     doc_da = nlp_da(full_text)
                     doc_en = nlp_en(full_text)
@@ -420,7 +589,8 @@ def setup_database(cursor):
     """
     Sets up the MSSQL database table if it doesn't exist.
     """
-    create_table_query = """
+    # Create JobIndexPostingsExtended table (without Category column)
+    create_jobs_table = """
     IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='JobIndexPostingsExtended' and xtype='U')
     CREATE TABLE JobIndexPostingsExtended (
         JobID INT IDENTITY(1,1) PRIMARY KEY,
@@ -431,18 +601,65 @@ def setup_database(cursor):
         JobDescription NVARCHAR(MAX),
         JobUrl NVARCHAR(512) UNIQUE,
         Published DATETIME,
-        Category NVARCHAR(255),
         BannerPicture VARBINARY(MAX),
         FooterPicture VARBINARY(MAX),
         Keywords NVARCHAR(MAX)
     )
     """
+    # Create Categories table
+    create_categories_table = """
+    IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='Categories' and xtype='U')
+    CREATE TABLE Categories (
+        CategoryID INT IDENTITY(1,1) PRIMARY KEY,
+        Name NVARCHAR(255) UNIQUE
+    )
+    """
+    # Create JobCategories join table
+    create_jobcategories_table = """
+    IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='JobCategories' and xtype='U')
+    CREATE TABLE JobCategories (
+        JobID INT NOT NULL,
+        CategoryID INT NOT NULL,
+        PRIMARY KEY (JobID, CategoryID),
+        FOREIGN KEY (JobID) REFERENCES JobIndexPostingsExtended(JobID) ON DELETE CASCADE,
+        FOREIGN KEY (CategoryID) REFERENCES Categories(CategoryID) ON DELETE CASCADE
+    )
+    """
     try:
-        cursor.execute(create_table_query)
+        cursor.execute(create_jobs_table)
+        cursor.execute(create_categories_table)
+        cursor.execute(create_jobcategories_table)
         cursor.commit()
-        print("[Main] Database table 'JobIndexPostingsExtended' checked/created successfully.")
+        print("[Main] Database tables checked/created successfully.")
     except Exception as e:
-        print(f"[Main] Error setting up database table: {e}")
+        print(f"[Main] Error setting up database tables: {e}")
+
+# --- Category helper functions ---
+def get_or_create_category(cursor, category_name):
+    """
+    Returns CategoryID for the given name, creating it if it doesn't exist.
+    """
+    cursor.execute("SELECT CategoryID FROM Categories WHERE Name = ?", category_name)
+    row = cursor.fetchone()
+    if row:
+        return row[0]
+    cursor.execute("INSERT INTO Categories (Name) VALUES (?)", category_name)
+    cursor.execute("SELECT CategoryID FROM Categories WHERE Name = ?", category_name)
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+def link_job_category(cursor, job_id, category_id):
+    """
+    Links a job to a category in JobCategories (if not already linked).
+    """
+    cursor.execute("SELECT 1 FROM JobCategories WHERE JobID = ? AND CategoryID = ?", job_id, category_id)
+    if not cursor.fetchone():
+        cursor.execute("INSERT INTO JobCategories (JobID, CategoryID) VALUES (?, ?)", job_id, category_id)
+
+def get_jobid_by_url(cursor, job_url):
+    cursor.execute("SELECT JobID FROM JobIndexPostingsExtended WHERE JobUrl = ?", job_url)
+    row = cursor.fetchone()
+    return row[0] if row else None
 
 def scrape_and_store(start_url, db_config, category):
     """
@@ -453,6 +670,7 @@ def scrape_and_store(start_url, db_config, category):
     data_queue = queue.Queue() # Queue for passing job data to the DB writer thread
     db_writer_thread = DatabaseWriter(db_config, data_queue)
     db_writer_thread.start()
+    setup_existing_joburls()  
 
     page_num = 1
     total_jobs_scraped = 0
@@ -511,9 +729,11 @@ def scrape_and_store(start_url, db_config, category):
             current_page_listings = extract_job_data(html_content, category)
             
             if current_page_listings:
-                data_queue.put(current_page_listings) 
-                total_jobs_scraped += len(current_page_listings)
-                print(f"[Main] Found {len(current_page_listings)} job listings on Page {page_num}. Added to queue.")
+                data_queue.put(current_page_listings)
+                # Count only new jobs for total_jobs_scraped
+                new_jobs = [j for j in current_page_listings if j["JobUrl"] not in EXISTING_JOB_URLS]
+                total_jobs_scraped += len(new_jobs)
+                print(f"[Main] Found {len(current_page_listings)} job listings on Page {page_num}. Added to queue. New jobs: {len(new_jobs)}")
             else:
                 print(f"[Main] No job listings found on Page {page_num}. This page might be empty or end of results.")
 
@@ -559,9 +779,29 @@ def scrape_and_store(start_url, db_config, category):
 
 if __name__ == "__main__":
     setup_database_connection()
-    setup_existing_joburls()
     setup_scraping_urls()
+
+    import threading
+    max_concurrent_threads = 8
+    semaphore = threading.Semaphore(max_concurrent_threads)
+    threads = []
+
+    def scrape_category_thread(category, url, db_config):
+        try:
+            print(f"[Main] Starting scrape for category '{category}' with URL: {url}")
+            scrape_and_store(url, db_config, category)
+        except Exception as e:
+            print(f"[Thread] Error in category {category}: {e}")
+        finally:
+            semaphore.release()
+
     for category, url in JOBINDEX_URLS.items():
-        setup_existing_joburls()
-        print(f"[Main] Starting scrape for category '{category}' with URL: {url}")
-        scrape_and_store(url, DATABASE_CONFIG, category)
+        semaphore.acquire()
+        t = threading.Thread(target=scrape_category_thread, args=(category, url, DATABASE_CONFIG))
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join()
+
+    print("[Main] All category threads have completed.")
