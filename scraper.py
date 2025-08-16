@@ -154,9 +154,10 @@ class DatabaseWriter(threading.Thread):
             self.cnxn.rollback()
 
     def insert_job_data_single(self, job_data, commit=True):
+        # Note: We no longer store keywords in JobIndexPostingsExtended. They go into JobKeywords.
         insert_query = """
-        INSERT INTO JobIndexPostingsExtended (CompanyName, CompanyURL, JobTitle, JobLocation, JobDescription, JobUrl, Published, BannerPicture, FooterPicture, Keywords)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO JobIndexPostingsExtended (CompanyName, CompanyURL, JobTitle, JobLocation, JobDescription, JobUrl, Published, BannerPicture, FooterPicture)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         try:
             self.cursor.execute(insert_query,
@@ -168,8 +169,7 @@ class DatabaseWriter(threading.Thread):
                                 job_data["JobUrl"],
                                 job_data["Published"],
                                 job_data["BannerPicture"],
-                                job_data["FooterPicture"],
-                                job_data["Keywords"])
+                                job_data["FooterPicture"])
             self.cursor.execute("SELECT JobID FROM JobIndexPostingsExtended WHERE JobUrl = ?", job_data["JobUrl"])
             row = self.cursor.fetchone()
             if row:
@@ -177,6 +177,9 @@ class DatabaseWriter(threading.Thread):
                 category_id = get_or_create_category(self.cursor, job_data["Category"])
                 if category_id:
                     link_job_category(self.cursor, job_id, category_id)
+                # Insert keywords into the new JobKeywords table
+                if job_data.get("KeywordsDetailed"):
+                    insert_keywords(self.cursor, job_id, job_data["KeywordsDetailed"])
             if commit:
                 self.cnxn.commit()
         except pyodbc.Error as ex:
@@ -437,32 +440,61 @@ def extract_job_data(html_content, category):
             if time_tag:
                 published_date = time_tag.get('datetime')
 
-        # --- Keyword extraction using spaCy (Danish and English), YAKE, and RAKE ---
-        keywords = []
-        custom_stopwords = {"job", "stilling", "company", "virksomhed", "arbejde", "position", "ansøgning", "opgaver", category_name.lower()}
+        # --- Keyword extraction using YAKE (Danish and English) and category keyword ---
+        keywords_detailed = []  # list of dicts: {Keyword, Source, ConfidenceScore}
+        keywords_for_display = []
+        try:
+            stop_category = category_name.lower() if isinstance(category_name, str) else None
+        except Exception:
+            stop_category = None
+        custom_stopwords = {"job", "stilling", "company", "virksomhed", "arbejde", "position", "ansøgning", "opgaver"}
+        if stop_category:
+            custom_stopwords.add(stop_category)
+        def add_keyword(kw, source, score=None):
+            if not kw:
+                return
+            k = kw.strip()
+            if len(k) <= 1:
+                return
+            if k.lower() in custom_stopwords:
+                return
+            # Convert YAKE score (lower is better) to confidence in [0,1]
+            conf = None
+            if score is not None:
+                try:
+                    conf = max(0.0, min(1.0, 1.0 - float(score)))
+                except Exception:
+                    conf = None
+            keywords_detailed.append({"Keyword": k, "Source": source, "ConfidenceScore": conf})
+            keywords_for_display.append(k)
         if job_description and job_url not in EXISTING_JOB_URLS:
-            # YAKE (Danish)
             try:
                 import yake
                 kw_extractor_da = yake.KeywordExtractor(lan="da", n=1, top=10)
-                yake_keywords_da = [kw for kw, score in kw_extractor_da.extract_keywords(job_description)]
-                keywords.extend([k for k in yake_keywords_da if k.lower() not in custom_stopwords])
-            except Exception as e:
+                for kw, score in kw_extractor_da.extract_keywords(job_description):
+                    add_keyword(kw, "yake-da", score)
+            except Exception:
                 pass
-            # YAKE (English)
             try:
+                import yake
                 kw_extractor_en = yake.KeywordExtractor(lan="en", n=1, top=10)
-                yake_keywords_en = [kw for kw, score in kw_extractor_en.extract_keywords(job_description)]
-                keywords.extend([k for k in yake_keywords_en if k.lower() not in custom_stopwords])
-            except Exception as e:
+                for kw, score in kw_extractor_en.extract_keywords(job_description):
+                    add_keyword(kw, "yake-en", score)
+            except Exception:
                 pass
-            # Add the category name as a keyword (domain knowledge)
-            if category_name and category_name.lower() not in custom_stopwords:
-                keywords.append(category_name)
-            # Filter, deduplicate, and clean
-            keywords = [k.strip() for k in keywords if len(k.strip()) > 1]
-            keywords = list(dict.fromkeys(keywords))  # preserve order, remove duplicates
-        keywords_str = ", ".join(keywords)
+            # Add category as a domain keyword with fixed medium confidence
+            if category_name and isinstance(category_name, str):
+                add_keyword(category_name, "category", 0.5)
+            # Deduplicate by keyword, keep highest confidence if multiple
+            dedup = {}
+            for item in keywords_detailed:
+                key = item["Keyword"].lower()
+                existing = dedup.get(key)
+                if existing is None or (item["ConfidenceScore"] or 0) > (existing["ConfidenceScore"] or 0):
+                    dedup[key] = item
+            keywords_detailed = list(dedup.values())
+            keywords_for_display = [item["Keyword"] for item in keywords_detailed]
+        keywords_str = ", ".join(keywords_for_display)
 
         job_listings.append({
             "CompanyName": company_name,
@@ -475,7 +507,8 @@ def extract_job_data(html_content, category):
             "Category": category_name,
             "BannerPicture": banner_picture_bytes,
             "FooterPicture": footer_picture_bytes,
-            "Keywords": keywords_str,
+            "Keywords": keywords_str,  # kept for display/compatibility
+            "KeywordsDetailed": keywords_detailed,
         })
     return job_listings
 
@@ -492,7 +525,7 @@ def setup_database(cursor):
     """
     Sets up the MSSQL database table if it doesn't exist.
     """
-    # Create JobIndexPostingsExtended table (without Category column)
+    # Create JobIndexPostingsExtended table (without embedded keywords)
     create_jobs_table = """
     IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='JobIndexPostingsExtended' and xtype='U')
     CREATE TABLE JobIndexPostingsExtended (
@@ -505,8 +538,7 @@ def setup_database(cursor):
         JobUrl NVARCHAR(512) UNIQUE,
         Published DATETIME,
         BannerPicture VARBINARY(MAX),
-        FooterPicture VARBINARY(MAX),
-        Keywords NVARCHAR(MAX)
+        FooterPicture VARBINARY(MAX)
     )
     """
     # Create Categories table
@@ -528,10 +560,23 @@ def setup_database(cursor):
         FOREIGN KEY (CategoryID) REFERENCES Categories(CategoryID) ON DELETE CASCADE
     )
     """
+    # Create JobKeywords table
+    create_jobkeywords_table = """
+    IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='JobKeywords' and xtype='U')
+    CREATE TABLE JobKeywords (
+        KeywordID INT IDENTITY(1,1) PRIMARY KEY,
+        JobID INT NOT NULL,
+        Keyword NVARCHAR(255) NOT NULL,
+        Source NVARCHAR(50) NULL,
+        ConfidenceScore FLOAT NULL,
+        FOREIGN KEY (JobID) REFERENCES JobIndexPostingsExtended(JobID) ON DELETE CASCADE
+    )
+    """
     try:
         cursor.execute(create_jobs_table)
         cursor.execute(create_categories_table)
         cursor.execute(create_jobcategories_table)
+        cursor.execute(create_jobkeywords_table)
         cursor.commit()
         print("[Main] Database tables checked/created successfully.")
     except Exception as e:
@@ -563,6 +608,25 @@ def get_jobid_by_url(cursor, job_url):
     cursor.execute("SELECT JobID FROM JobIndexPostingsExtended WHERE JobUrl = ?", job_url)
     row = cursor.fetchone()
     return row[0] if row else None
+
+def insert_keywords(cursor, job_id, keywords_detailed):
+    """
+    Insert a list of keyword dicts into JobKeywords for the given job_id.
+    keywords_detailed: [{"Keyword": str, "Source": str|None, "ConfidenceScore": float|None}, ...]
+    """
+    if not keywords_detailed:
+        return
+    try:
+        for item in keywords_detailed:
+            cursor.execute(
+                "INSERT INTO JobKeywords (JobID, Keyword, Source, ConfidenceScore) VALUES (?, ?, ?, ?)",
+                job_id,
+                item.get("Keyword"),
+                item.get("Source"),
+                item.get("ConfidenceScore")
+            )
+    except Exception as e:
+        print(f"[DB Writer] Failed inserting keywords for JobID {job_id}: {e}")
 
 def scrape_and_store(start_url, db_config, category):
     """

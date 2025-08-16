@@ -79,28 +79,60 @@ The script will iterate through all job categories and store job postings in the
 ### Advanced Keyword Extraction
 
 - Uses the best available spaCy models for Danish and English (NER and noun chunks)
-- Integrates [YAKE](https://github.com/LIAAD/yake) and [RAKE](https://github.com/csurfer/rake-nltk) for multi-word keyphrase extraction
+- Integrates [YAKE](https://github.com/LIAAD/yake) for single-word keywords (Danish and English)
 - Uses the job category as a domain-specific keyword
-- All extracted keywords are stored in the `Keywords` column
+- Extracted keywords are now stored in a separate `JobKeywords` table with source and confidence score; a human-readable comma-separated list is still kept in-memory for display but no longer stored in `JobIndexPostingsExtended`
 
-## Database Table
+## Database Tables
 
-The script will automatically create the following table if it does not exist:
+The script will automatically create these tables if they do not exist:
 
-| Column         | Type            | Description                |
-|----------------|-----------------|----------------------------|
-| JobID          | INT (PK)        | Auto-incremented ID        |
-| CompanyName    | NVARCHAR(255)   | Name of the company        |
-| CompanyURL     | NVARCHAR(MAX)   | URL to the company         |
-| JobTitle       | NVARCHAR(MAX)   | Title of the job           |
-| JobLocation    | NVARCHAR(255)   | Location of the job        |
-| JobDescription | NVARCHAR(MAX)   | Description of the job     |
-| JobUrl         | NVARCHAR(512)   | Unique URL of the posting  |
-| Published      | DATETIME        | Date published             |
-| Category       | NVARCHAR(255)   | Job category               |
-| BannerPicture  | VARBINARY(MAX)  | Banner image (if any)      |
-| FooterPicture  | VARBINARY(MAX)  | Footer image (if any)      |
-| Keywords       | NVARCHAR(MAX)   | Extracted keywords/phrases |
+JobIndexPostingsExtended
+
+- JobID INT (PK)
+- CompanyName NVARCHAR(255)
+- CompanyURL NVARCHAR(MAX)
+- JobTitle NVARCHAR(MAX)
+- JobLocation NVARCHAR(255)
+- JobDescription NVARCHAR(MAX)
+- JobUrl NVARCHAR(512) UNIQUE
+- Published DATETIME
+- BannerPicture VARBINARY(MAX)
+- FooterPicture VARBINARY(MAX)
+
+Categories
+
+- CategoryID INT (PK)
+- Name NVARCHAR(255) UNIQUE
+
+JobCategories (join)
+
+- JobID INT (FK -> JobIndexPostingsExtended.JobID)
+- CategoryID INT (FK -> Categories.CategoryID)
+- PRIMARY KEY (JobID, CategoryID)
+
+JobKeywords
+
+- KeywordID INT (PK)
+- JobID INT (FK -> JobIndexPostingsExtended.JobID)
+- Keyword NVARCHAR(255) NOT NULL
+- Source NVARCHAR(50) NULL
+- ConfidenceScore FLOAT NULL
+
+## Migration Notes
+
+- If you previously had a `Keywords` column in `JobIndexPostingsExtended`, it is no longer used by this script. You may optionally migrate legacy values into `JobKeywords` by splitting on commas and inserting rows with `Source='legacy'` and `ConfidenceScore=NULL`.
+- Example T-SQL (optional):
+
+```
+-- One-time migration example: split comma-separated legacy keywords
+-- Adjust STRING_SPLIT usage as needed for your SQL Server version
+INSERT INTO JobKeywords (JobID, Keyword, Source, ConfidenceScore)
+SELECT j.JobID, LTRIM(RTRIM(value)) AS Keyword, 'legacy' AS Source, NULL AS ConfidenceScore
+FROM JobIndexPostingsExtended j
+CROSS APPLY STRING_SPLIT(COALESCE(j.Keywords, ''), ',') s
+WHERE LTRIM(RTRIM(value)) <> '';
+```
 
 ## Notes
 
