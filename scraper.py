@@ -5,6 +5,7 @@ import threading
 import queue
 import requests
 import tempfile
+import re
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
@@ -21,6 +22,25 @@ JOBINDEX_URLS = {}
 DATABASE_CONFIG = {}
 JOBINDEX_BASE_URL = "https://www.jobindex.dk"
 EXISTING_JOB_URLS = set()
+"""
+Global banned keywords list. These are filtered from JobKeywords. Combined with spaCy DA/EN stopwords and optional config overrides.
+"""
+BANNED_KEYWORDS = set()
+_DK_COMMON = [
+    # Danish common function words / pronouns / determiners / prepositions
+    "og", "i", "på", "af", "for", "med", "til", "fra", "om", "over", "under",
+    "den", "det", "de", "der", "som", "en", "et", "din", "dit", "dine", "min", "mit", "mine",
+    "han", "hun", "vi", "jeg", "du", "man", "jer", "os",
+    "er", "var", "bliver", "blev", "kan", "skal", "må", "bør", "kun", "ikke",
+]
+_EN_COMMON = [
+    # English common stopwords (short subset)
+    "the", "and", "or", "for", "to", "of", "in", "on", "at", "by", "from", "is", "are", "was", "were",
+    "this", "that", "these", "those", "your", "our", "their", "his", "her", "its", "you", "we", "they",
+]
+BANNED_KEYWORDS.update({w.lower() for w in _DK_COMMON})
+BANNED_KEYWORDS.update({w.lower() for w in _EN_COMMON})
+EXTRA_BANNED_KEYWORDS = set()
 
 def setup_existing_joburls():
     conn = pyodbc.connect(
@@ -44,10 +64,11 @@ def setup_database_connection():
     
     config = configparser.ConfigParser()
 
+    # Read default first, then overlay development if present (dev overrides defaults)
     if os.path.exists(CONFIG_DEVELOPMENT_FILE_PATH):
-        config.read(CONFIG_DEVELOPMENT_FILE_PATH)
+        config.read([CONFIG_FILE_PATH, CONFIG_DEVELOPMENT_FILE_PATH])
     else:
-        config.read(CONFIG_FILE_PATH)
+        config.read([CONFIG_FILE_PATH])
 
     if 'database' in config:
         DATABASE_CONFIG["server"] = config['database'].get("server")
@@ -56,6 +77,13 @@ def setup_database_connection():
         DATABASE_CONFIG["password"] = config['database'].get("password")
     else:
         print("Warning: [database] section not found in config.ini")
+    # Optional: read extra banned keywords from config
+    if 'keywords' in config:
+        raw = config['keywords'].get('banned', fallback='')
+        if raw:
+            # Split by comma or newline/semicolon
+            parts = re.split(r'[\n,;]+', raw)
+            EXTRA_BANNED_KEYWORDS.update({p.strip().lower() for p in parts if p.strip()})
 
 def setup_scraping_urls():
     for subid in range(1, 250):
@@ -448,6 +476,17 @@ def extract_job_data(html_content, category):
         except Exception:
             stop_category = None
         custom_stopwords = {"job", "stilling", "company", "virksomhed", "arbejde", "position", "ansøgning", "opgaver"}
+        # Merge banned keywords and spaCy DA/EN stopwords
+        try:
+            custom_stopwords.update({w.lower() for w in nlp_da.Defaults.stop_words})
+        except Exception:
+            pass
+        try:
+            custom_stopwords.update({w.lower() for w in nlp_en.Defaults.stop_words})
+        except Exception:
+            pass
+        custom_stopwords.update(BANNED_KEYWORDS)
+        custom_stopwords.update(EXTRA_BANNED_KEYWORDS)
         if stop_category:
             custom_stopwords.add(stop_category)
         def add_keyword(kw, source, score=None):
@@ -456,7 +495,12 @@ def extract_job_data(html_content, category):
             k = kw.strip()
             if len(k) <= 1:
                 return
-            if k.lower() in custom_stopwords:
+            # If the whole key or all its word tokens are stopwords/banned, skip
+            kl = k.lower()
+            if kl in custom_stopwords:
+                return
+            tokens = re.findall(r"\w+", kl)
+            if tokens and all(t in custom_stopwords for t in tokens):
                 return
             # Convert YAKE score (lower is better) to confidence in [0,1]
             conf = None
