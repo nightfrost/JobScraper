@@ -6,6 +6,7 @@ import queue
 import requests
 import tempfile
 import re
+from datetime import datetime, timezone
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
@@ -15,6 +16,11 @@ from bs4 import BeautifulSoup
 import pyodbc 
 import spacy
 from spacy.util import is_package
+
+try:
+    import yake  # Optional keyword extractor
+except ImportError:
+    yake = None
 
 CONFIG_FILE_PATH = os.path.join(os.path.dirname(__file__), 'config.ini')
 CONFIG_DEVELOPMENT_FILE_PATH = os.path.join(os.path.dirname(__file__), 'config.development.ini')
@@ -41,6 +47,22 @@ _EN_COMMON = [
 BANNED_KEYWORDS.update({w.lower() for w in _DK_COMMON})
 BANNED_KEYWORDS.update({w.lower() for w in _EN_COMMON})
 EXTRA_BANNED_KEYWORDS = set()
+
+TARGET_KEYWORD_COUNT = 20
+
+YAKE_EXTRACTOR_DA = None
+YAKE_EXTRACTOR_EN = None
+if yake:
+    try:
+        YAKE_EXTRACTOR_DA = yake.KeywordExtractor(lan="da", n=1, top=TARGET_KEYWORD_COUNT)
+    except Exception as e:
+        print(f"[Keywords] Failed to initialize YAKE Danish extractor: {e}")
+        YAKE_EXTRACTOR_DA = None
+    try:
+        YAKE_EXTRACTOR_EN = yake.KeywordExtractor(lan="en", n=1, top=TARGET_KEYWORD_COUNT)
+    except Exception as e:
+        print(f"[Keywords] Failed to initialize YAKE English extractor: {e}")
+        YAKE_EXTRACTOR_EN = None
 
 def setup_existing_joburls():
     conn = pyodbc.connect(
@@ -79,11 +101,15 @@ def setup_database_connection():
         print("Warning: [database] section not found in config.ini")
     # Optional: read extra banned keywords from config
     if 'keywords' in config:
-        raw = config['keywords'].get('banned', fallback='')
-        if raw:
-            # Split by comma or newline/semicolon
-            parts = re.split(r'[\n,;]+', raw)
-            EXTRA_BANNED_KEYWORDS.update({p.strip().lower() for p in parts if p.strip()})
+        def load_banned(raw_value):
+            if not raw_value:
+                return
+            parts_local = re.split(r'[\n,;]+', raw_value)
+            EXTRA_BANNED_KEYWORDS.update({p.strip().lower() for p in parts_local if p.strip()})
+
+        load_banned(config['keywords'].get('banned', fallback=''))
+        load_banned(config['keywords'].get('banned_danish', fallback=''))
+        load_banned(config['keywords'].get('banned_english', fallback=''))
 
 def setup_scraping_urls():
     for subid in range(1, 250):
@@ -108,6 +134,18 @@ class DatabaseWriter(threading.Thread):
                 print(f"[DB Writer] Linked job {job_url} to category '{new_category}' (ID {category_id})")
         except Exception as e:
             print(f"[DB Writer] Error updating category for {job_url}: {e}")
+
+    def update_seen_last_for_joburl(self, job_url):
+        """Update the SeenLast marker for an existing job."""
+        try:
+            self.cursor.execute(
+                "UPDATE JobIndexPostingsExtended SET SeenLast = ? WHERE JobUrl = ?",
+                datetime.now(timezone.utc),
+                job_url
+            )
+        except pyodbc.Error as ex:
+            print(f"[DB Writer] Error updating SeenLast for {job_url}: {ex}")
+
     def __init__(self, db_config, data_queue, batch_size=20):
         super().__init__()
         self.db_config = db_config
@@ -173,6 +211,7 @@ class DatabaseWriter(threading.Thread):
             for job_data in job_batch:
                 self.cursor.execute("SELECT JobUrl FROM JobIndexPostingsExtended WHERE JobUrl = ?", job_data["JobUrl"])
                 if self.cursor.fetchone():
+                    self.update_seen_last_for_joburl(job_data["JobUrl"])
                     self.update_category_for_joburl(job_data["JobUrl"], job_data["Category"])
                 else:
                     self.insert_job_data_single(job_data, commit=False)
@@ -184,8 +223,8 @@ class DatabaseWriter(threading.Thread):
     def insert_job_data_single(self, job_data, commit=True):
         # Note: We no longer store keywords in JobIndexPostingsExtended. They go into JobKeywords.
         insert_query = """
-        INSERT INTO JobIndexPostingsExtended (CompanyName, CompanyURL, JobTitle, JobLocation, JobDescription, JobUrl, Published, BannerPicture, FooterPicture)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO JobIndexPostingsExtended (CompanyName, CompanyURL, JobTitle, JobLocation, JobDescription, JobUrl, Published, BannerPicture, FooterPicture, SeenLast)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         try:
             self.cursor.execute(insert_query,
@@ -197,7 +236,8 @@ class DatabaseWriter(threading.Thread):
                                 job_data["JobUrl"],
                                 job_data["Published"],
                                 job_data["BannerPicture"],
-                                job_data["FooterPicture"])
+                                job_data["FooterPicture"],
+                                datetime.now(timezone.utc))
             self.cursor.execute("SELECT JobID FROM JobIndexPostingsExtended WHERE JobUrl = ?", job_data["JobUrl"])
             row = self.cursor.fetchone()
             if row:
@@ -512,31 +552,54 @@ def extract_job_data(html_content, category):
             keywords_detailed.append({"Keyword": k, "Source": source, "ConfidenceScore": conf})
             keywords_for_display.append(k)
         if job_description and job_url not in EXISTING_JOB_URLS:
-            try:
-                import yake
-                kw_extractor_da = yake.KeywordExtractor(lan="da", n=1, top=10)
-                for kw, score in kw_extractor_da.extract_keywords(job_description):
-                    add_keyword(kw, "yake-da", score)
-            except Exception:
-                pass
-            try:
-                import yake
-                kw_extractor_en = yake.KeywordExtractor(lan="en", n=1, top=10)
-                for kw, score in kw_extractor_en.extract_keywords(job_description):
-                    add_keyword(kw, "yake-en", score)
-            except Exception:
-                pass
+            if YAKE_EXTRACTOR_DA:
+                try:
+                    for kw, score in YAKE_EXTRACTOR_DA.extract_keywords(job_description):
+                        add_keyword(kw, "yake-da", score)
+                except Exception as e:
+                    print(f"[Keywords] YAKE Danish extraction failed: {e}")
+            if YAKE_EXTRACTOR_EN:
+                try:
+                    for kw, score in YAKE_EXTRACTOR_EN.extract_keywords(job_description):
+                        add_keyword(kw, "yake-en", score)
+                except Exception as e:
+                    print(f"[Keywords] YAKE English extraction failed: {e}")
             # Add category as a domain keyword with fixed medium confidence
             if category_name and isinstance(category_name, str):
                 add_keyword(category_name, "category", 0.5)
             # Deduplicate by keyword, keep highest confidence if multiple
             dedup = {}
-            for item in keywords_detailed:
+            order_index = {}
+            for idx, item in enumerate(keywords_detailed):
                 key = item["Keyword"].lower()
                 existing = dedup.get(key)
-                if existing is None or (item["ConfidenceScore"] or 0) > (existing["ConfidenceScore"] or 0):
+                if existing is None:
                     dedup[key] = item
-            keywords_detailed = list(dedup.values())
+                    order_index[key] = idx
+                else:
+                    existing_conf = existing["ConfidenceScore"] or 0
+                    new_conf = item["ConfidenceScore"] or 0
+                    if new_conf > existing_conf:
+                        dedup[key] = item
+            dedup_items = list(dedup.items())
+            dedup_items.sort(
+                key=lambda entry, ord_idx=order_index: (
+                    (entry[1]["ConfidenceScore"] if entry[1]["ConfidenceScore"] is not None else -1),
+                    -ord_idx.get(entry[0], 0)
+                ),
+                reverse=True
+            )
+            keywords_detailed = [item for _, item in dedup_items]
+            if len(keywords_detailed) > TARGET_KEYWORD_COUNT:
+                category_lower = None
+                if category_name and isinstance(category_name, str):
+                    category_lower = category_name.strip().lower()
+                trimmed = keywords_detailed[:TARGET_KEYWORD_COUNT]
+                if category_lower and all(k["Keyword"].lower() != category_lower for k in trimmed):
+                    category_item = next((k for k in keywords_detailed if k["Keyword"].lower() == category_lower), None)
+                    if category_item:
+                        trimmed[-1] = category_item
+                keywords_detailed = trimmed
             keywords_for_display = [item["Keyword"] for item in keywords_detailed]
         keywords_str = ", ".join(keywords_for_display)
 
@@ -554,6 +617,8 @@ def extract_job_data(html_content, category):
             "Keywords": keywords_str,  # kept for display/compatibility
             "KeywordsDetailed": keywords_detailed,
         })
+        if job_url:
+            EXISTING_JOB_URLS.add(job_url)
     return job_listings
 
 def download_image_as_bytes(url):
@@ -577,12 +642,13 @@ def setup_database(cursor):
         CompanyName NVARCHAR(255),
         CompanyURL NVARCHAR(MAX),
         JobTitle NVARCHAR(MAX),
-        JobLocation NVARCHAR(255),
+        JobLocation NVARCHAR(MAX),
         JobDescription NVARCHAR(MAX),
         JobUrl NVARCHAR(512) UNIQUE,
         Published DATETIME,
         BannerPicture VARBINARY(MAX),
-        FooterPicture VARBINARY(MAX)
+        FooterPicture VARBINARY(MAX),
+        SeenLast DATETIME NULL
     )
     """
     # Create Categories table
@@ -616,11 +682,33 @@ def setup_database(cursor):
         FOREIGN KEY (JobID) REFERENCES JobIndexPostingsExtended(JobID) ON DELETE CASCADE
     )
     """
+    # Ensure JobLocation extends to NVARCHAR(MAX) for existing deployments
+    alter_joblocation_column = """
+    IF EXISTS (
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = 'JobIndexPostingsExtended'
+          AND COLUMN_NAME = 'JobLocation'
+          AND DATA_TYPE = 'nvarchar'
+          AND (CHARACTER_MAXIMUM_LENGTH IS NOT NULL AND CHARACTER_MAXIMUM_LENGTH <> -1)
+    )
+        ALTER TABLE JobIndexPostingsExtended ALTER COLUMN JobLocation NVARCHAR(MAX) NULL
+    """
+    # Ensure SeenLast column exists
+    ensure_seenlast_column = """
+    IF NOT EXISTS (
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = 'JobIndexPostingsExtended'
+          AND COLUMN_NAME = 'SeenLast'
+    )
+        ALTER TABLE JobIndexPostingsExtended ADD SeenLast DATETIME NULL
+    """
     try:
         cursor.execute(create_jobs_table)
         cursor.execute(create_categories_table)
         cursor.execute(create_jobcategories_table)
         cursor.execute(create_jobkeywords_table)
+        cursor.execute(alter_joblocation_column)
+        cursor.execute(ensure_seenlast_column)
         cursor.commit()
         print("[Main] Database tables checked/created successfully.")
     except Exception as e:
@@ -661,7 +749,7 @@ def insert_keywords(cursor, job_id, keywords_detailed):
     if not keywords_detailed:
         return
     try:
-        for item in keywords_detailed:
+        for item in keywords_detailed[:TARGET_KEYWORD_COUNT]:
             cursor.execute(
                 "INSERT INTO JobKeywords (JobID, Keyword, Source, ConfidenceScore) VALUES (?, ?, ?, ?)",
                 job_id,

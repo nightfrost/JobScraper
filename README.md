@@ -93,12 +93,13 @@ JobIndexPostingsExtended
 - CompanyName NVARCHAR(255)
 - CompanyURL NVARCHAR(MAX)
 - JobTitle NVARCHAR(MAX)
-- JobLocation NVARCHAR(255)
+- JobLocation NVARCHAR(MAX)
 - JobDescription NVARCHAR(MAX)
 - JobUrl NVARCHAR(512) UNIQUE
 - Published DATETIME
 - BannerPicture VARBINARY(MAX)
 - FooterPicture VARBINARY(MAX)
+- SeenLast DATETIME NULL
 
 Categories
 
@@ -136,6 +137,7 @@ WHERE LTRIM(RTRIM(value)) <> '';
 
 ## Notes
 
+- Each scrape updates the `SeenLast` timestamp so you can deactivate rows that go stale (`UPDATE JobIndexPostingsExtended SET IsActive = 0 WHERE SeenLast < DATEADD(day, -30, GETUTCDATE())`, etc.).
 - The script is designed for educational and research purposes. Please respect the terms of service of jobindex.dk.
 - For large-scale scraping, consider adding delays or rate limiting to avoid overloading the target site.
 
