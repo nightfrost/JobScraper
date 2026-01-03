@@ -136,10 +136,10 @@ class DatabaseWriter(threading.Thread):
             print(f"[DB Writer] Error updating category for {job_url}: {e}")
 
     def update_seen_last_for_joburl(self, job_url):
-        """Update the SeenLast marker for an existing job."""
+        """Update the SeenLast marker for an existing job and mark active."""
         try:
             self.cursor.execute(
-                "UPDATE JobIndexPostingsExtended SET SeenLast = ? WHERE JobUrl = ?",
+                "UPDATE JobIndexPostingsExtended SET SeenLast = ?, IsActive = 1 WHERE JobUrl = ?",
                 datetime.now(timezone.utc),
                 job_url
             )
@@ -223,8 +223,8 @@ class DatabaseWriter(threading.Thread):
     def insert_job_data_single(self, job_data, commit=True):
         # Note: We no longer store keywords in JobIndexPostingsExtended. They go into JobKeywords.
         insert_query = """
-        INSERT INTO JobIndexPostingsExtended (CompanyName, CompanyURL, JobTitle, JobLocation, JobDescription, JobUrl, Published, BannerPicture, FooterPicture, SeenLast)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO JobIndexPostingsExtended (CompanyName, CompanyURL, JobTitle, JobLocation, JobDescription, JobUrl, Published, BannerPicture, FooterPicture, SeenLast, IsActive)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         try:
             self.cursor.execute(insert_query,
@@ -237,7 +237,8 @@ class DatabaseWriter(threading.Thread):
                                 job_data["Published"],
                                 job_data["BannerPicture"],
                                 job_data["FooterPicture"],
-                                datetime.now(timezone.utc))
+                                datetime.now(timezone.utc),
+                                1)
             self.cursor.execute("SELECT JobID FROM JobIndexPostingsExtended WHERE JobUrl = ?", job_data["JobUrl"])
             row = self.cursor.fetchone()
             if row:
@@ -398,6 +399,21 @@ def extract_job_data(html_content, category):
             # fallback: less strict, return more of the original text
             return full_text[:1500]
 
+    def dedupe_description_lines(text):
+        if not text:
+            return text
+        seen = set()
+        deduped_lines = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped in seen:
+                continue
+            seen.add(stripped)
+            deduped_lines.append(stripped)
+        return "\n".join(deduped_lines) if deduped_lines else None
+
     def extract_fallbacks(company_name, company_url, job_location, doc_da, doc_en, full_text):
         def is_missing(val):
             return val is None or (isinstance(val, str) and not val.strip())
@@ -496,6 +512,7 @@ def extract_job_data(html_content, category):
                         soup2 = BeautifulSoup(resp.text, 'html.parser')
                         _, _, full_text = get_main_content(soup2, job_url_full)
                         job_description = extract_job_description(full_text, category_name)
+                        job_description = dedupe_description_lines(job_description)
                         doc_da = nlp_da(full_text)
                         doc_en = nlp_en(full_text)
                         company_name, company_url, job_location = extract_fallbacks(company_name, company_url, job_location, doc_da, doc_en, full_text)
@@ -648,7 +665,8 @@ def setup_database(cursor):
         Published DATETIME,
         BannerPicture VARBINARY(MAX),
         FooterPicture VARBINARY(MAX),
-        SeenLast DATETIME NULL
+        SeenLast DATETIME NULL,
+        IsActive BIT NOT NULL DEFAULT 1
     )
     """
     # Create Categories table
@@ -702,6 +720,24 @@ def setup_database(cursor):
     )
         ALTER TABLE JobIndexPostingsExtended ADD SeenLast DATETIME NULL
     """
+    ensure_isactive_column = """
+    IF NOT EXISTS (
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = 'JobIndexPostingsExtended'
+          AND COLUMN_NAME = 'IsActive'
+    )
+        ALTER TABLE JobIndexPostingsExtended ADD IsActive BIT NOT NULL CONSTRAINT DF_JobIndexPostingsExtended_IsActive DEFAULT 1
+    """
+    backfill_isactive = """
+    UPDATE JobIndexPostingsExtended SET IsActive = 1 WHERE IsActive IS NULL
+    """
+    ensure_seenlast_index = """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.indexes WHERE name = 'IX_JobIndexPostingsExtended_SeenLast'
+          AND object_id = OBJECT_ID('JobIndexPostingsExtended')
+    )
+        CREATE NONCLUSTERED INDEX IX_JobIndexPostingsExtended_SeenLast ON JobIndexPostingsExtended (SeenLast)
+    """
     try:
         cursor.execute(create_jobs_table)
         cursor.execute(create_categories_table)
@@ -709,6 +745,9 @@ def setup_database(cursor):
         cursor.execute(create_jobkeywords_table)
         cursor.execute(alter_joblocation_column)
         cursor.execute(ensure_seenlast_column)
+        cursor.execute(ensure_isactive_column)
+        cursor.execute(backfill_isactive)
+        cursor.execute(ensure_seenlast_index)
         cursor.commit()
         print("[Main] Database tables checked/created successfully.")
     except Exception as e:
@@ -759,6 +798,33 @@ def insert_keywords(cursor, job_id, keywords_detailed):
             )
     except Exception as e:
         print(f"[DB Writer] Failed inserting keywords for JobID {job_id}: {e}")
+
+
+def cleanup_stale_jobs(db_config, days=1):
+    """Soft-delete jobs whose SeenLast is older than the given day threshold."""
+    try:
+        with pyodbc.connect(
+            'DRIVER={ODBC Driver 17 for SQL Server};'
+            f'SERVER={db_config["server"]};'
+            f'DATABASE={db_config["database"]};'
+            f'UID={db_config["username"]};'
+            f'PWD={db_config["password"]}'
+        ) as cnxn:
+            cursor = cnxn.cursor()
+            cursor.execute(
+                """
+                UPDATE JobIndexPostingsExtended
+                SET IsActive = 0
+                WHERE SeenLast < DATEADD(day, -?, GETUTCDATE())
+                  AND IsActive = 1
+                """,
+                days
+            )
+            affected = cursor.rowcount
+            cnxn.commit()
+            print(f"[Cleanup] Soft-deactivated {affected if affected is not None else 0} stale jobs (>{days} day(s) old).")
+    except Exception as e:
+        print(f"[Cleanup] Failed to soft-delete stale jobs: {e}")
 
 def scrape_and_store(start_url, db_config, category):
     """
@@ -922,4 +988,5 @@ if __name__ == "__main__":
     for t in threads:
         t.join()
 
+    cleanup_stale_jobs(DATABASE_CONFIG, days=1)
     print("[Main] All category threads have completed.")
